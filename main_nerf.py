@@ -91,7 +91,7 @@ if __name__ == '__main__':
     seed_everything(opt.seed)
 
     model = NeRFNetwork(
-        encoding="hashgrid",
+        encoding="mortongrid",
         bound=opt.bound,
         cuda_ray=opt.cuda_ray,
         density_scale=1,

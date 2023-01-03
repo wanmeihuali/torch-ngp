@@ -62,6 +62,24 @@ __device__ uint32_t fast_hash(const uint32_t pos_grid[D]) {
     return result;
 }
 
+__device__ uint32_t morton_spread(const uint32_t x) {
+    uint32_t v = x;
+    v = (v | (v << 16)) & 0x030000FF;
+    v = (v | (v << 8)) & 0x0300F00F;
+    v = (v | (v << 4)) & 0x030C30C3;
+    v = (v | (v << 2)) & 0x09249249;
+    return v;
+}
+template <uint32_t D>
+__device__ uint32_t morton_encode(const uint32_t pos_grid[D]) {
+    #pragma unroll
+    uint32_t result = 0;
+    for (uint32_t i = 0; i < D; ++i) {
+        result |= morton_spread(pos_grid[i]) << i;
+    }
+    return result;
+}
+
 
 template <uint32_t D, uint32_t C>
 __device__ uint32_t get_grid_index(const uint32_t gridtype, const bool align_corners, const uint32_t ch, const uint32_t hashmap_size, const uint32_t resolution, const uint32_t pos_grid[D]) {
@@ -78,6 +96,8 @@ __device__ uint32_t get_grid_index(const uint32_t gridtype, const bool align_cor
     // gridtype: 0 == hash, 1 == tiled
     if (gridtype == 0 && stride > hashmap_size) {
         index = fast_hash<D>(pos_grid);
+    } else if (gridtype == 2) {
+        index = morton_encode<D>(pos_grid);
     }
 
     return (index % hashmap_size) * C + ch;

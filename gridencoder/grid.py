@@ -14,6 +14,7 @@ except ImportError:
 _gridtype_to_id = {
     'hash': 0,
     'tiled': 1,
+    'morton': 2,
 }
 
 _interp_to_id = {
