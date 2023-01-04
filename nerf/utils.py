@@ -492,12 +492,12 @@ class Trainer(object):
             loss = loss.mean(0)
 
         # update error_map
-        if self.error_map is not None:
+        if "error_map" in data:
             index = data['index'] # [B]
             inds = data['inds_coarse'] # [B, N]
 
             # take out, this is an advanced indexing and the copy is unavoidable.
-            error_map = self.error_map[index] # [B, H * W]
+            error_map = data["error_map"][index] # [B, H * W]
 
             # [debug] uncomment to save and visualize error map
             # if self.global_step % 1001 == 0:
@@ -513,7 +513,7 @@ class Trainer(object):
             error_map.scatter_(1, inds, ema_error)
 
             # put back
-            self.error_map[index] = error_map
+            data["error_map"][index] = error_map
 
         loss = loss.mean()
 
@@ -600,9 +600,6 @@ class Trainer(object):
         if self.model.cuda_ray:
             self.model.mark_untrained_grid(train_loader._data.poses, train_loader._data.intrinsics)
 
-        # get a ref to error_map
-        self.error_map = train_loader._data.error_map
-        
         for epoch in range(self.epoch + 1, max_epochs + 1):
             self.epoch = epoch
 
@@ -820,6 +817,11 @@ class Trainer(object):
             self.global_step += 1
 
             self.optimizer.zero_grad()
+            if "dataset_index" in data:
+                self.model.encoder.fetch_scene_encoders(data["dataset_index"])
+                self.optimizer.add_param_group({'params': self.model.encoder.get_active_parameters()})
+                self.model.encoder_dir.fetch_scene_encoders(data["dataset_index"])
+                self.optimizer.add_param_group({'params': self.model.encoder_dir.get_active_parameters()})
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss = self.train_step(data)
@@ -827,6 +829,10 @@ class Trainer(object):
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
+
+            if "dataset_index" in data:
+                self.model.encoder.remove_cold_encoders_from_device()
+                self.model.encoder_dir.remove_cold_encoders_from_device()
 
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()

@@ -92,33 +92,39 @@ class NeRFNetwork(NeRFRenderer):
             self.bg_net = None
 
 
-    def forward(self, x, d):
+    def forward(self, x, d, scene_indices=None):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
 
         # sigma
-        x = self.encoder(x, bound=self.bound)
+        if scene_indices is None:
+            x = self.encoder(x, bound=self.bound) # [N, F]
+        else:
+            x = self.encoder(x, bound=self.bound, scene_indices=scene_indices)
 
-        h = x
-        for l in range(self.num_layers):
+        h = x # [N, F]
+        for l in range(self.num_layers): # [N, F] -> [N, 1 + geo_feat_dim]
             h = self.sigma_net[l](h)
             if l != self.num_layers - 1:
                 h = F.relu(h, inplace=True)
 
         #sigma = F.relu(h[..., 0])
-        sigma = trunc_exp(h[..., 0])
-        geo_feat = h[..., 1:]
+        sigma = trunc_exp(h[..., 0]) # [N, 1]
+        geo_feat = h[..., 1:] # [N, geo_feat_dim]
 
         # color
-        
-        d = self.encoder_dir(d)
-        h = torch.cat([d, geo_feat], dim=-1)
-        for l in range(self.num_layers_color):
+
+        if scene_indices is None:
+            d = self.encoder_dir(d) # [N, F]
+        else:
+            d = self.encoder_dir(d, scene_indices=scene_indices)
+        h = torch.cat([d, geo_feat], dim=-1) # [N, F + geo_feat_dim]
+        for l in range(self.num_layers_color): # [N, F + geo_feat_dim] -> [N, 3]
             h = self.color_net[l](h)
             if l != self.num_layers_color - 1:
                 h = F.relu(h, inplace=True)
         
-        # sigmoid activation for rgb
+        # sigmoid activation for rgb, so that it is in [0, 1]
         color = torch.sigmoid(h)
 
         return sigma, color

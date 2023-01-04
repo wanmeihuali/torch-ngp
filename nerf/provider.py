@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .utils import get_rays
+import bisect
 
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
@@ -92,7 +93,7 @@ def rand_poses(size, device, radius=1, theta_range=[np.pi/3, 2*np.pi/3], phi_ran
 
 
 class NeRFDataset:
-    def __init__(self, opt, device, type='train', downscale=1, n_test=10):
+    def __init__(self, opt, device, type='train', downscale=1, n_test=10, preload_image=True):
         super().__init__()
         
         self.opt = opt
@@ -110,6 +111,7 @@ class NeRFDataset:
         self.num_rays = self.opt.num_rays if self.training else -1
 
         self.rand_pose = opt.rand_pose
+        self.preload_image = preload_image
 
         # auto-detect transforms.json and split mode.
         if os.path.exists(os.path.join(self.root_path, 'transforms.json')):
@@ -204,27 +206,23 @@ class NeRFDataset:
                 pose = np.array(f['transform_matrix'], dtype=np.float32) # [4, 4]
                 pose = nerf_matrix_to_ngp(pose, scale=self.scale, offset=self.offset)
 
-                image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
                 if self.H is None or self.W is None:
+                    image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED)  # [H, W, 3] o [H, W, 4]
                     self.H = image.shape[0] // downscale
                     self.W = image.shape[1] // downscale
 
-                # add support for the alpha channel as a mask.
-                if image.shape[-1] == 3: 
-                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                if self.preload_image:
+                    image = cv2.imread(f_path, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
+                    # add support for the alpha channel as a mask.
+                    image = self.transform_image(image)
+                    self.images.append(image)
                 else:
-                    image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
-
-                if image.shape[0] != self.H or image.shape[1] != self.W:
-                    image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
-                    
-                image = image.astype(np.float32) / 255 # [H, W, 3/4]
+                    self.images.append(f_path)
 
                 self.poses.append(pose)
-                self.images.append(image)
-            
+
         self.poses = torch.from_numpy(np.stack(self.poses, axis=0)) # [N, 4, 4]
-        if self.images is not None:
+        if self.images is not None and self.preload_image:
             self.images = torch.from_numpy(np.stack(self.images, axis=0)) # [N, H, W, C]
         
         # calculate mean radius of all camera poses
@@ -233,7 +231,8 @@ class NeRFDataset:
 
         # initialize error_map
         if self.training and self.opt.error_map:
-            self.error_map = torch.ones([self.images.shape[0], 128 * 128], dtype=torch.float) # [B, 128 * 128], flattened for easy indexing, fixed resolution...
+            image_count = self.images.shape[0] if self.images is not None and self.preload_image else len(self.images)
+            self.error_map = torch.ones([image_count, 128 * 128], dtype=torch.float) # [B, 128 * 128], flattened for easy indexing, fixed resolution...
         else:
             self.error_map = None
 
@@ -245,7 +244,7 @@ class NeRFDataset:
 
         if self.preload:
             self.poses = self.poses.to(self.device)
-            if self.images is not None:
+            if self.images is not None and self.preload_image:
                 # TODO: linear use pow, but pow for half is only available for torch >= 1.10 ?
                 if self.fp16 and self.opt.color_space != 'linear':
                     dtype = torch.half
@@ -272,6 +271,18 @@ class NeRFDataset:
         cy = (transform['cy'] / downscale) if 'cy' in transform else (self.H / 2)
     
         self.intrinsics = np.array([fl_x, fl_y, cx, cy])
+
+    def transform_image(self, image):
+        if image.shape[-1] == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
+
+        if image.shape[0] != self.H or image.shape[1] != self.W:
+            image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
+
+        image = image.astype(np.float32) / 255  # [H, W, 3/4]
+        return image
 
 
     def collate(self, index):
@@ -309,7 +320,21 @@ class NeRFDataset:
         }
 
         if self.images is not None:
-            images = self.images[index].to(self.device) # [B, H, W, 3/4]
+            if self.preload_image:
+                images = self.images[index].to(self.device) # [B, H, W, 3/4]
+            else:
+                images = []
+                for i in index:
+                    image = cv2.imread(self.images[i], cv2.IMREAD_UNCHANGED)
+                    image = self.transform_image(image)
+                    images.append(image)
+                images = torch.from_numpy(np.stack(images, axis=0))
+                if self.fp16 and self.opt.color_space != 'linear':
+                    images = images.to(torch.half)
+                else:
+                    images = images.to(torch.float)
+                images = images.to(self.device)
+
             if self.training:
                 C = images.shape[-1]
                 images = torch.gather(images.view(B, -1, C), 1, torch.stack(C * [rays['inds']], -1)) # [B, N, 3/4]
@@ -319,6 +344,7 @@ class NeRFDataset:
         if error_map is not None:
             results['index'] = index
             results['inds_coarse'] = rays['inds_coarse']
+            results['error_map'] = self.error_map
             
         return results
 
@@ -330,3 +356,96 @@ class NeRFDataset:
         loader._data = self # an ugly fix... we need to access error_map & poses in trainer.
         loader.has_gt = self.images is not None
         return loader
+
+class MultiDataset:
+    """
+    A wrapper around multiple datasets.
+    Different datasets should have the same settings except for the data path.
+    The dataloader will return a batch of data from different datasets.
+    """
+    def __init__(self, datasets):
+        self.datasets = datasets
+        self.num_rays = datasets[0].num_rays
+        self.training = datasets[0].training
+        self.opt = datasets[0].opt
+        self.device = datasets[0].device
+        self.fp16 = datasets[0].fp16
+        self.preload = datasets[0].preload
+        self.rand_pose = datasets[0].rand_pose
+        self.bound = datasets[0].bound
+        self.radius = datasets[0].radius
+        self.intrinsics = datasets[0].intrinsics
+        self.H = datasets[0].H
+        self.W = datasets[0].W
+        self.total_size = sum([len(d.poses) for d in datasets])
+        self.dataset_size = [len(d.poses) for d in datasets]
+        self.index_offset = [0] + list(np.cumsum(self.dataset_size))
+        self.index_offset = torch.tensor(self.index_offset, dtype=torch.long)
+        self.has_gt = datasets[0].images is not None
+        for dataset in self.datasets:
+            assert dataset.num_rays == self.num_rays
+            assert dataset.training == self.training
+            assert dataset.device == self.device
+            assert dataset.fp16 == self.fp16
+            assert dataset.preload == self.preload
+            assert dataset.rand_pose == self.rand_pose
+            assert dataset.bound == self.bound
+            assert dataset.radius == self.radius
+            assert dataset.intrinsics == self.intrinsics
+            assert dataset.H == self.H
+            assert dataset.W == self.W
+
+    def dataloader(self):
+        loader = DataLoader(list(range(self.total_size)), batch_size=1, collate_fn=self.collate, shuffle=self.training, num_workers=0)
+        loader.has_gt = self.has_gt
+        return loader
+
+    def collate(self, index):
+        B = len(index)
+        dataset_index = torch.zeros(B, dtype=torch.long)
+        dataset_offset = torch.zeros(B, dtype=torch.long)
+        result_map = {}
+        for idx in index:
+            # find the dataset and the offset in the dataset for the given index
+            dataset_index[idx] = torch.argmax(self.index_offset[self.index_offset <= idx])
+            dataset_offset[idx] = idx - self.index_offset[dataset_index[idx]]
+            result_map[idx] = self.datasets[dataset_index[idx]].collate([dataset_offset[idx]]) # [1]
+            result_map[idx]['dataset_index'] = dataset_index[idx]
+            result_map[idx]['dataset_offset'] = dataset_offset[idx]
+        results = {}
+        for idx in index:
+            if "H" in results:
+                assert results["H"] == result_map[idx]["H"]
+            else:
+                results["H"] = result_map[idx]["H"]
+            if "W" in results:
+                assert results["W"] == result_map[idx]["W"]
+            else:
+                results["W"] = result_map[idx]["W"]
+            # rays_o and rays_d are all B x N x 3, so we can just concatenate them at the first dimension
+            if "rays_o" in results:
+                results["rays_o"] = torch.cat([results["rays_o"], result_map[idx]["rays_o"]], dim=0)
+            else:
+                results["rays_o"] = result_map[idx]["rays_o"]
+            if "rays_d" in results:
+                results["rays_d"] = torch.cat([results["rays_d"], result_map[idx]["rays_d"]], dim=0)
+            else:
+                results["rays_d"] = result_map[idx]["rays_d"]
+            # similarly, we can concatenate the images at the first dimension
+            if "images" in results and result_map[idx].get("images", None) is not None:
+                results["images"] = torch.cat([results["images"], result_map[idx]["images"]], dim=0)
+            else:
+                results["images"] = result_map[idx]["images"]
+            # the error map sucks, we don't implement it for now
+            if result_map[idx].get("error_map", None) is not None:
+                raise NotImplementedError
+        results["dataset_index"] = [result_map[idx]["dataset_index"] for idx in index]
+        results["dataset_index"] = torch.tensor(results["dataset_index"], dtype=torch.long)
+        return results
+
+
+
+
+
+
+
